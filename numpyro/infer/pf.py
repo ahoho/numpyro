@@ -43,14 +43,16 @@ class PF(object):
         """
         rng_key = jax.random.PRNGKey(0) # numpyro.prng_key()
         with block():
-            init_params, self._potential_fn, self._postprocess_fn, self.prototype_trace = initialize_model(
+            init_params, potential_fn, self._postprocess_fn, self.prototype_trace = initialize_model(
                 rng_key, self.model,
                 init_strategy=self.init_loc_fn,
                 dynamic_args=False,
                 model_args=args,
                 model_kwargs=kwargs)
 
-        self.latent_dim = init_params[0]['x'].shape[0]
+        init_params, self._unravel_fn = jax.flatten_util.ravel_pytree(init_params[0])
+        self._potential_fn = lambda x: potential_fn(self._unravel_fn(x))
+        self.latent_dim = init_params.shape[0]
         particles = random.normal(rng_key, shape=(self.num_particles, self.latent_dim))
 
         return PFState(particles, self.lr)
@@ -64,7 +66,10 @@ class PF(object):
         """
         params = pf_state.particles
         # params = self.constrain_fn(self.optim.get_params(svi_state.optim_state))
-        return params
+        # return params and its postprocessed values
+        unconstrained_params = vmap(self._unravel_fn)(params)
+        constrained_params = vmap(self._postprocess_fn)(unconstrained_params)
+        return params, unconstrained_params, constrained_params
 
     def update(self, pf_state, *args, **kwargs):
         """
@@ -76,7 +81,7 @@ class PF(object):
         :return: pf_state
         """
         particles, lr = pf_state
-        g = vmap(lambda p: grad(self._potential_fn)({'x': p}))(particles)['x']
+        g = vmap(lambda p: grad(self._potential_fn)(p))(particles)
         centered_particles = particles - particles.mean(0)
         quadratic_term = (centered_particles[:, None, :] @ centered_particles.T)[:, 0, :].T @ g / self.num_particles
         new_particles = particles - lr * (g.mean(0) + quadratic_term - centered_particles)
@@ -106,7 +111,7 @@ def model(rho=0.9):
 num_steps = 50_000
 gamma = 0.1 ** (1 / num_steps)
 pf = PF(model, 3, lr=0.003, gamma=gamma)
-particles = pf.run(num_steps)
+particles = pf.run(num_steps)[0]
 
 print("particles\n", particles)
 mean = particles.mean(0)
